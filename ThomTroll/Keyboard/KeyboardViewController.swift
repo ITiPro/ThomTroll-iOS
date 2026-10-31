@@ -18,6 +18,11 @@ final class KeyboardViewController: UIInputViewController {
     private var timer: Timer?
     private var deleteTimer: Timer?
     private var running = false
+    // A row and Return must be separate input events. Some host apps submit only
+    // when insertText receives exactly "\n", like the manual Return button.
+    private var pendingReturn = false
+    private var rowStartedAt: TimeInterval?
+    private var pendingReturnDelay: TimeInterval = 0.05
     private var waitingForCycle = false
     private var countdown = 0
     private var randomOrder = false
@@ -29,6 +34,8 @@ final class KeyboardViewController: UIInputViewController {
 
     override func viewDidLoad() {
         super.viewDidLoad()
+        let savedInterval = UserDefaults.standard.double(forKey: "messageInterval")
+        if savedInterval >= 0.1 { interval = min(10, savedInterval) }
         do { library = try LibraryStore().load() }
         catch { record("E_READ: \(error.localizedDescription)") }
         view.backgroundColor = UIColor(red: 0.035, green: 0.025, blue: 0.04, alpha: 1)
@@ -44,7 +51,7 @@ final class KeyboardViewController: UIInputViewController {
             root.topAnchor.constraint(equalTo: view.topAnchor, constant: 8),
             root.bottomAnchor.constraint(equalTo: view.safeAreaLayoutGuide.bottomAnchor, constant: -6)
         ])
-        heightConstraint = view.heightAnchor.constraint(equalToConstant: 350)
+        heightConstraint = view.heightAnchor.constraint(equalToConstant: 420)
         heightConstraint?.priority = .defaultHigh
         heightConstraint?.isActive = true
         content.axis = .vertical; content.spacing = 7
@@ -57,7 +64,7 @@ final class KeyboardViewController: UIInputViewController {
     override func viewDidLayoutSubviews() {
         super.viewDidLayoutSubviews()
         glow.frame = view.bounds
-        heightConstraint?.constant = view.bounds.width > 600 ? 285 : 350
+        heightConstraint?.constant = view.bounds.width > 600 ? 330 : 420
     }
 
     override func viewWillDisappear(_ animated: Bool) {
@@ -77,14 +84,15 @@ final class KeyboardViewController: UIInputViewController {
         let b = UIButton(type: .system)
         b.setTitle(title, for: .normal)
         b.setTitleColor(.white, for: .normal)
-        b.titleLabel?.font = .systemFont(ofSize: 15, weight: .semibold)
+        b.titleLabel?.font = .systemFont(ofSize: 16, weight: .semibold)
         b.titleLabel?.adjustsFontSizeToFitWidth = true
         b.titleLabel?.minimumScaleFactor = 0.7
         b.backgroundColor = accent ? red.withAlphaComponent(0.8) : UIColor(white: 0.13, alpha: 0.95)
         b.layer.cornerRadius = 11; b.layer.borderWidth = 0.5
         b.layer.borderColor = red.withAlphaComponent(0.20).cgColor
         b.addAction(UIAction { _ in action() }, for: .touchUpInside)
-        b.heightAnchor.constraint(greaterThanOrEqualToConstant: 34).isActive = true
+        let compactPrefix = page == 0 && prefixDraft != nil && view.bounds.width > 600
+        b.heightAnchor.constraint(greaterThanOrEqualToConstant: compactPrefix ? 34 : 44).isActive = true
         return b
     }
 
@@ -98,6 +106,7 @@ final class KeyboardViewController: UIInputViewController {
         guard isViewLoaded else { return }
         root.arrangedSubviews.forEach { root.removeArrangedSubview($0); $0.removeFromSuperview() }
         content.arrangedSubviews.forEach { content.removeArrangedSubview($0); $0.removeFromSuperview() }
+        content.distribution = page == 0 ? .fillEqually : .fill
         root.addArrangedSubview(row([
             button("АБВ", accent: page == 0) { [weak self] in self?.page = 0; self?.refresh() },
             button("Шаблоны", accent: page == 1) { [weak self] in self?.prefixDraft = nil; self?.page = 1; self?.refresh() },
@@ -114,6 +123,7 @@ final class KeyboardViewController: UIInputViewController {
         root.addArrangedSubview(status)
         if prefixDraft != nil { notice("Префикс редактируется здесь. В чат он пока не вводится.") }
         else if running { updateProgress() }
+        else if pendingReturn { notice("Пауза. Продолжить — выполнить Ввод для текущей фразы.") }
         else { notice(queue == nil ? "Ввод ↵: поведение отправки зависит от приложения." : "Пауза. Продолжить — со следующей целой строки.") }
     }
 
@@ -139,7 +149,9 @@ final class KeyboardViewController: UIInputViewController {
         for letters in lines {
             var buttons: [UIView] = letters.map { letter in
                 let value = shift ? String(letter).uppercased() : String(letter)
-                return button(value) { [weak self] in self?.insert(value) }
+                let key = button(value) { [weak self] in self?.insert(value) }
+                key.titleLabel?.font = .systemFont(ofSize: 22, weight: .medium)
+                return key
             }
             if letters == lines.last {
                 buttons.insert(button("⇧", accent: shift) { [weak self] in self?.shift.toggle(); self?.refresh() }, at: 0)
@@ -198,9 +210,24 @@ final class KeyboardViewController: UIInputViewController {
         content.addArrangedSubview(button(randomOrder ? "Порядок: рандом" : "Порядок: с начала") { [weak self] in
             guard let self = self else { return }; self.stop(); self.randomOrder.toggle(); self.refresh()
         })
-        content.addArrangedSubview(row([0.5, 1.0, 3.0].map { delay in
+        let speedLabel = UILabel(); speedLabel.textColor = .white
+        speedLabel.font = .systemFont(ofSize: 15, weight: .semibold)
+        speedLabel.text = "Интервал отправки: \(String(format: "%.1f", interval)) с"
+        content.addArrangedSubview(speedLabel)
+        content.addArrangedSubview(row([0.1, 0.2, 0.5, 1.0, 3.0].map { delay in
             button("\(delay) с", accent: interval == delay) { [weak self] in self?.interval = delay; self?.refresh() }
         }))
+        let slider = UISlider()
+        slider.minimumValue = 0.1; slider.maximumValue = 10; slider.value = Float(interval)
+        slider.minimumTrackTintColor = red
+        slider.accessibilityLabel = "Интервал отправки от 0.1 до 10 секунд"
+        slider.addAction(UIAction { [weak self, weak speedLabel, weak slider] _ in
+            guard let self = self, let slider = slider else { return }
+            self.interval = min(10, max(0.1, (Double(slider.value) * 10).rounded() / 10))
+            UserDefaults.standard.set(self.interval, forKey: "messageInterval")
+            speedLabel?.text = "Интервал отправки: \(String(format: "%.1f", self.interval)) с"
+        }, for: .valueChanged)
+        content.addArrangedSubview(slider)
         content.addArrangedSubview(button(repeatOn ? "Повтор: включён • перерыв 5 с" : "Повтор: выключен") { [weak self] in
             self?.repeatOn.toggle(); self?.refresh()
         })
@@ -210,8 +237,22 @@ final class KeyboardViewController: UIInputViewController {
         })
         let label = UILabel(); label.numberOfLines = 0; label.textColor = .lightGray
         label.font = .systemFont(ofSize: 12)
-        label.text = "Старт вставляет целые строки и ↵. Это не нажатие кнопки отправки. Для импорта нужен полный доступ. Звук и видео в эту первую версию не включены."
+        label.text = "Сначала фраза, затем отдельный Ввод ↵. Интервал — между началами фраз, 0.1–10 с; меньше = быстрее. Игра может не успевать на 0.1 с. Для импорта нужен полный доступ."
         content.addArrangedSubview(label)
+        let options = content.arrangedSubviews
+        options.forEach { content.removeArrangedSubview($0); $0.removeFromSuperview() }
+        let scroll = UIScrollView()
+        let list = UIStackView(arrangedSubviews: options); list.axis = .vertical; list.spacing = 8
+        list.translatesAutoresizingMaskIntoConstraints = false; scroll.addSubview(list)
+        NSLayoutConstraint.activate([
+            list.leadingAnchor.constraint(equalTo: scroll.contentLayoutGuide.leadingAnchor),
+            list.trailingAnchor.constraint(equalTo: scroll.contentLayoutGuide.trailingAnchor),
+            list.topAnchor.constraint(equalTo: scroll.contentLayoutGuide.topAnchor),
+            list.bottomAnchor.constraint(equalTo: scroll.contentLayoutGuide.bottomAnchor),
+            list.widthAnchor.constraint(equalTo: scroll.frameLayoutGuide.widthAnchor)
+        ])
+        content.addArrangedSubview(scroll)
+        UserDefaults.standard.set(interval, forKey: "messageInterval")
     }
 
     private func insert(_ text: String) {
@@ -220,7 +261,10 @@ final class KeyboardViewController: UIInputViewController {
             draft += text; prefixDraft = draft; refresh()
         } else {
             let wasRunning = running
-            pause(); textDocumentProxy.insertText(text)
+            pause()
+            consumePendingRow()
+            if text == "\n" { performReturn() }
+            else { textDocumentProxy.insertText(text) }
             if wasRunning { refresh() }
         }
     }
@@ -229,7 +273,7 @@ final class KeyboardViewController: UIInputViewController {
             if !draft.isEmpty { draft.removeLast() }; prefixDraft = draft; refresh()
         } else {
             let wasRunning = running
-            pause(); textDocumentProxy.deleteBackward()
+            pause(); consumePendingRow(); textDocumentProxy.deleteBackward()
             if wasRunning { refresh() }
         }
     }
@@ -250,7 +294,7 @@ final class KeyboardViewController: UIInputViewController {
     private func importClipboard() {
         pause()
         if let incoming = pendingImport {
-            library = incoming; pendingImport = nil; queue = nil; persist(); refresh()
+            stop(); library = incoming; pendingImport = nil; persist(); refresh()
             notice("Коллекция обновлена."); return
         }
         guard hasFullAccess else { notice("Для импорта включи полный доступ у ThomTroll в настройках iPhone."); return }
@@ -269,10 +313,28 @@ final class KeyboardViewController: UIInputViewController {
         return true
     }
     private func insertNext(newline: Bool) {
+        guard !pendingReturn else {
+            notice("Текущая фраза ждёт Ввод. Нажми Ввод или Продолжить."); return
+        }
         guard ensureQueue(), let line = queue?.current else { return }
         let prefix = library.prefix.isEmpty ? "" : library.prefix + " "
-        textDocumentProxy.insertText(prefix + line + (newline ? "\n" : ""))
-        queue?.advance(); updateProgress()
+        if newline {
+            pendingReturn = true
+            rowStartedAt = ProcessInfo.processInfo.systemUptime
+            pendingReturnDelay = min(0.15, interval / 2)
+        }
+        textDocumentProxy.insertText(prefix + line)
+        if !newline { queue?.advance(); updateProgress() }
+    }
+    private func performReturn() {
+        // Shared by the manual key and automatic input. Never append this to
+        // the phrase: the host must receive a standalone Return input event.
+        textDocumentProxy.insertText("\n")
+    }
+    private func consumePendingRow() {
+        guard pendingReturn else { return }
+        pendingReturn = false
+        queue?.advance()
     }
     private func start() {
         if queue?.isFinished == true, repeatOn {
@@ -295,20 +357,34 @@ final class KeyboardViewController: UIInputViewController {
             countdown -= 1; schedule(after: 1); return
         }
         if waitingForCycle { queue?.restart(); waitingForCycle = false }
+        if pendingReturn {
+            let started = rowStartedAt
+            consumePendingRow()
+            performReturn()
+            updateProgress()
+            let elapsed = started.map { ProcessInfo.processInfo.systemUptime - $0 } ?? 0
+            rowStartedAt = nil
+            if running { schedule(after: max(0.01, interval - elapsed)) }
+            return
+        }
         if queue?.isFinished == true {
             if repeatOn { waitingForCycle = true; countdown = 5; schedule(after: 0.01) }
             else { pause(); refresh(); notice("Шаблон закончился. Стоп — начать сначала.") }
             return
         }
         insertNext(newline: true)
-        schedule(after: interval)
+        // Let the app process the phrase before delivering Return on a later
+        // run-loop turn. The interval measures phrase-to-phrase time and includes
+        // this delay, so selecting 0.1 s does not secretly produce a 0.25 s cycle.
+        if running { schedule(after: pendingReturnDelay) }
     }
     private func pause() {
         timer?.invalidate(); timer = nil; running = false
-        // Each row is inserted in one call: there is no half-written phrase to resume.
+        // If paused between a phrase and Return, resume only sends Return;
+        // it must not insert the phrase twice. Stop cancels both phases.
     }
     private func stop() {
-        pause(); queue = nil; editorID = nil; waitingForCycle = false; countdown = 0
+        pause(); pendingReturn = false; rowStartedAt = nil; queue = nil; editorID = nil; waitingForCycle = false; countdown = 0
     }
     private func updateProgress() {
         if let q = queue { notice("Цикл \(q.cycle) • вставлено строк: \(q.position)/\(q.rows.count). Отправку проверь в игре.") }
